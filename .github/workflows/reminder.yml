@@ -10,14 +10,14 @@ on:
     - cron: '7 14 * * 1,2'
     - cron: '7 15 * * 1,2'
 
-  # Whenever the schedule is edited: validate it, run the tests, regenerate SCHEDULE.md.
+  # Whenever the code or settings are edited by hand: validate, test, regenerate.
   push:
     branches: [main]
     paths:
       - 'schedule.json'
       - 'rotation.py'
       - 'tests/**'
-      - '.github/workflows/reminder.yml'
+      - '.github/workflows/*.yml'
 
   # Manual runs from the Actions tab.
   workflow_dispatch:
@@ -39,8 +39,9 @@ on:
 permissions:
   contents: write
 
+# Never run at the same time as the sheet-sync job (both commit to the repo).
 concurrency:
-  group: group-meeting-reminder
+  group: group-meeting-repo
   cancel-in-progress: false
 
 jobs:
@@ -65,16 +66,29 @@ jobs:
         if: github.event_name == 'push'
         run: python -m unittest discover -s tests -v
 
+      # Make sure the reminder reflects the very latest sheet. If the sheet can't be
+      # read, warn and carry on with the last synced schedule — the reminder must go out.
+      - name: Refresh from the availability sheet
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && startsWith(inputs.action, 'reminder'))
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SHEET_TAB: ${{ vars.GOOGLE_SHEET_TAB }}
+          SHEET_CSV_URL: ${{ secrets.SHEET_CSV_URL }}
+        run: python rotation.py sync-sheet || echo "::warning::Could not refresh from the sheet; using the last synced schedule."
+
       - name: Send reminder (scheduled)
         if: github.event_name == 'schedule'
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
         run: python rotation.py remind
 
       - name: Manual action
         if: github.event_name == 'workflow_dispatch'
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           ACTION: ${{ inputs.action }}
           TODAY: ${{ inputs.today }}
         run: |
@@ -89,22 +103,22 @@ jobs:
             *) echo "unknown action: $ACTION"; exit 1 ;;
           esac
 
-      - name: Regenerate SCHEDULE.md
-        run: python rotation.py render-md
+      - name: Regenerate SCHEDULE.md / schedule.csv
+        run: python rotation.py render
 
-      - name: Commit SCHEDULE.md / state.json if they changed
+      - name: Commit generated files if they changed
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add SCHEDULE.md
+          git add schedule.json SCHEDULE.md schedule.csv
           if [ -f state.json ]; then git add state.json; fi
           if git diff --cached --quiet; then
             echo "Nothing to commit."
             exit 0
           fi
           git commit -m "Update generated schedule/state (${{ github.event_name }})"
-          # Someone may have edited schedule.json while this ran: retry a few times.
+          # Someone may have pushed while this ran: retry a few times.
           for attempt in 1 2 3; do
             if git push; then exit 0; fi
             echo "push failed (attempt $attempt), rebasing…"

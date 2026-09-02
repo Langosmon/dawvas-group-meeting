@@ -1,0 +1,74 @@
+name: Sync availability sheet
+
+# Reads the shared Google Sheet ("Availability" tab) every 30 minutes, writes it
+# into schedule.json, and posts a "schedule updated" message to Slack when the
+# outcome (who presents when) changed. Needs the GOOGLE_SHEET_ID secret.
+
+on:
+  schedule:
+    - cron: '13,43 * * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: What to do
+        type: choice
+        default: sync
+        options:
+          - sync            # update schedule.json and post changes to Slack
+          - dry-run         # only show what would change
+
+permissions:
+  contents: write
+
+# Never run at the same time as the reminder job (both commit to the repo).
+concurrency:
+  group: group-meeting-repo
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Pull the sheet into schedule.json
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SHEET_TAB: ${{ vars.GOOGLE_SHEET_TAB }}
+          SHEET_CSV_URL: ${{ secrets.SHEET_CSV_URL }}
+        run: |
+          if [ "${{ inputs.mode || 'sync' }}" = "dry-run" ]; then
+            python rotation.py sync-sheet --dry-run
+          else
+            python rotation.py sync-sheet
+          fi
+
+      - name: Regenerate SCHEDULE.md / schedule.csv
+        run: python rotation.py render
+
+      - name: Commit if anything changed
+        if: ${{ inputs.mode != 'dry-run' }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add schedule.json SCHEDULE.md schedule.csv
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+            exit 0
+          fi
+          git commit -m "Sync availability sheet"
+          for attempt in 1 2 3; do
+            if git push; then exit 0; fi
+            echo "push failed (attempt $attempt), rebasing…"
+            git pull --rebase origin "${GITHUB_REF_NAME:-main}"
+          done
+          git push

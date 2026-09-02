@@ -1,0 +1,113 @@
+name: Group meeting reminder
+
+on:
+  schedule:
+    # 10:07 AM Eastern on Monday (for Tuesday's meeting) and Tuesday (for Wednesday's).
+    # GitHub cron is UTC, so two entries cover daylight time (UTC-4) and standard time
+    # (UTC-5). rotation.py only posts once local time is past 10:00, and never posts
+    # twice for the same meeting, so exactly one of these two runs sends the message.
+    # (":07" instead of ":00" because top-of-the-hour runs queue up on GitHub.)
+    - cron: '7 14 * * 1,2'
+    - cron: '7 15 * * 1,2'
+
+  # Whenever the schedule is edited: validate it, run the tests, regenerate SCHEDULE.md.
+  push:
+    branches: [main]
+    paths:
+      - 'schedule.json'
+      - 'rotation.py'
+      - 'tests/**'
+      - '.github/workflows/reminder.yml'
+
+  # Manual runs from the Actions tab.
+  workflow_dispatch:
+    inputs:
+      action:
+        description: What to do
+        type: choice
+        default: reminder-dry-run
+        options:
+          - reminder-dry-run     # show what would be posted, post nothing
+          - reminder             # post tomorrow's reminder now (even if already posted)
+          - post-schedule        # post the remaining semester schedule to the channel
+          - test-post            # post a one-line connectivity test
+      today:
+        description: 'Pretend today is this date (YYYY-MM-DD). Optional; for testing.'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: group-meeting-reminder
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Validate schedule.json
+        run: python rotation.py validate
+
+      - name: Run tests
+        if: github.event_name == 'push'
+        run: python -m unittest discover -s tests -v
+
+      - name: Send reminder (scheduled)
+        if: github.event_name == 'schedule'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: python rotation.py remind
+
+      - name: Manual action
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ACTION: ${{ inputs.action }}
+          TODAY: ${{ inputs.today }}
+        run: |
+          set -euo pipefail
+          TODAY_ARG=""
+          if [ -n "$TODAY" ]; then TODAY_ARG="--today $TODAY"; fi
+          case "$ACTION" in
+            reminder-dry-run) python rotation.py remind --force --dry-run $TODAY_ARG ;;
+            reminder)         python rotation.py remind --force $TODAY_ARG ;;
+            post-schedule)    python rotation.py post-schedule $TODAY_ARG ;;
+            test-post)        python rotation.py test-post ;;
+            *) echo "unknown action: $ACTION"; exit 1 ;;
+          esac
+
+      - name: Regenerate SCHEDULE.md
+        run: python rotation.py render-md
+
+      - name: Commit SCHEDULE.md / state.json if they changed
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add SCHEDULE.md
+          if [ -f state.json ]; then git add state.json; fi
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+            exit 0
+          fi
+          git commit -m "Update generated schedule/state (${{ github.event_name }})"
+          # Someone may have edited schedule.json while this ran: retry a few times.
+          for attempt in 1 2 3; do
+            if git push; then exit 0; fi
+            echo "push failed (attempt $attempt), rebasing…"
+            git pull --rebase origin "${GITHUB_REF_NAME:-main}"
+          done
+          git push

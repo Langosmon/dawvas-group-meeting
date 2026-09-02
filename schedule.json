@@ -51,11 +51,7 @@
   "joined": {},
   "left": {},
   "_synced_from_sheet": "The four sections below are filled in automatically from the Google Sheet.",
-  "unavailable": {
-    "Jose": [
-      "2026-09-29"
-    ]
-  },
+  "unavailable": {},
   "special_sessions": {
     "2026-09-16": {
       "title": "AI session: using Agents on Purdue RCAC",

@@ -8,34 +8,54 @@ ever needed.
 
 Rotation rule (from the lab):
   * People present in a fixed order, N per meeting (N = presenters_per_meeting).
-  * If someone who is up is unavailable, the next person in line takes the slot
-    and the skipped person presents at the next meeting they are available.
+  * If someone who is up is unavailable, they swap dates with the next scheduled
+    person who can make it; nobody else moves.
     Example: order A B C D E F.  Tue -> A, B.  Wed (D away) -> C, E.  Next -> D, F.
+    Then A, B again exactly as originally planned.
   * Special sessions (advisor workshop, AI training, ...) and no-meeting days
     pause the rotation: nobody is "used up" on those dates.
+
+Where the information comes from:
+  * schedule.json holds the rotation, the semester dates and the meeting days.
+  * A shared Google Sheet ("Availability" tab) is where people mark themselves
+    out and where special sessions / cancelled meetings are entered.
+    `sync-sheet` copies it into the unavailable / special_sessions / no_meeting /
+    overrides sections of schedule.json and posts a "schedule updated" alert
+    to Slack when the outcome changed.  No Google credentials are needed: the
+    sheet is read through its CSV export, which works for link-shared sheets.
 
 Commands
   python rotation.py validate                 check schedule.json for mistakes
   python rotation.py schedule                 print the semester schedule
-  python rotation.py render-md                write SCHEDULE.md
+  python rotation.py render                   write SCHEDULE.md and schedule.csv
   python rotation.py remind [--today D] [--dry-run] [--force] [--min-hour 10]
                                               post tomorrow's reminder to Slack
+  python rotation.py sync-sheet [--dry-run] [--csv-file F] [--today D]
+                                              pull the Google Sheet into schedule.json
+  python rotation.py sheet-template           print the Availability tab as CSV
   python rotation.py post-schedule [--dry-run] post the remaining schedule to Slack
   python rotation.py test-post [--dry-run]    post a connectivity test message
 
 Environment
   SLACK_WEBHOOK_URL     incoming-webhook URL for the channel (secret)
+  GOOGLE_SHEET_ID       the long id in the sheet's URL (secret; the sheet is link-shared)
+  GOOGLE_SHEET_TAB      tab name to read (default "Availability")
+  SHEET_CSV_URL         optional: full CSV URL, overrides the two above
   GITHUB_SERVER_URL / GITHUB_REPOSITORY   set by GitHub Actions; used for links
 """
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import json
 import os
+import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
-from collections import Counter, deque
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -46,6 +66,7 @@ ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "schedule.json"
 STATE_PATH = ROOT / "state.json"
 SCHEDULE_MD_PATH = ROOT / "SCHEDULE.md"
+SCHEDULE_CSV_PATH = ROOT / "schedule.csv"
 
 WEEKDAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
 WEEKDAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
@@ -132,13 +153,18 @@ def _public(d: dict) -> dict:
     return {k: v for k, v in d.items() if not str(k).startswith("_")}
 
 
-def load_config(path: Path = CONFIG_PATH) -> Config:
+def load_config(path: Optional[Path] = None) -> Config:
+    path = path or CONFIG_PATH
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         raise ConfigError(f"{path.name} not found")
     except json.JSONDecodeError as e:
         raise ConfigError(f"{path.name} is not valid JSON: {e}")
+    return config_from_dict(raw)
+
+
+def config_from_dict(raw: dict) -> Config:
     raw = _public(raw)
     warnings: list[str] = []
 
@@ -283,11 +309,18 @@ def load_config(path: Path = CONFIG_PATH) -> Config:
 # Rotation engine
 # --------------------------------------------------------------------------- #
 @dataclass
+class Swap:
+    out: str                        # the person who couldn't make it
+    stand_in: Optional[str]         # who took their slot (None = nobody could)
+    new_date: Optional[date]        # when the absent person presents instead
+
+
+@dataclass
 class Meeting:
     date: date
     kind: str                      # "regular" | "special" | "no_meeting"
     presenters: list[str] = field(default_factory=list)
-    skipped: list[str] = field(default_factory=list)   # were up, but unavailable
+    swaps: list[Swap] = field(default_factory=list)     # absences resolved on this date
     title: Optional[str] = None    # special-session title or no-meeting reason
     lead: Optional[str] = None
     note: Optional[str] = None
@@ -295,6 +328,11 @@ class Meeting:
     @property
     def is_meeting(self) -> bool:
         return self.kind != "no_meeting"
+
+    @property
+    def skipped(self) -> list[str]:
+        """People who were scheduled for this date but were unavailable."""
+        return [s.out for s in self.swaps]
 
 
 def meeting_dates(cfg: Config):
@@ -306,44 +344,150 @@ def meeting_dates(cfg: Config):
 
 
 def build_schedule(cfg: Config) -> list[Meeting]:
-    queue: deque[str] = deque(cfg.rotation)
+    """
+    1. Lay out the baseline: walk the rotation cyclically, N people per regular
+       meeting. Special sessions and no-meeting days consume nobody's turn.
+    2. Resolve absences, in date order, as SWAPS: an unavailable person trades
+       dates with the next scheduled person who can make it. Nobody else moves,
+       so one absence changes exactly two meetings.  (A B C D E F: Tue A,B;
+       Wed with D away -> C,E; next Tue -> D,F; then A,B as originally planned.)
+    3. Overrides pin a date's presenters; the people they displace take the
+       override-person's next slot, so everyone still presents equally often.
+    """
     n = cfg.presenters_per_meeting
-    out: list[Meeting] = []
+    order = cfg.rotation
+    dates = list(meeting_dates(cfg))
+    fixed: dict[date, Meeting] = {}
+    slots: dict[date, list[Optional[str]]] = {}
 
-    for d in meeting_dates(cfg):
+    # --- 1. baseline ------------------------------------------------------- #
+    ptr = 0
+    for d in dates:
         if d in cfg.no_meeting:
-            out.append(Meeting(d, "no_meeting", title=cfg.no_meeting[d]))
+            fixed[d] = Meeting(d, "no_meeting", title=cfg.no_meeting[d])
             continue
         if d in cfg.special_sessions:
             s = cfg.special_sessions[d]
-            out.append(Meeting(d, "special", title=s.title, lead=s.lead))
+            fixed[d] = Meeting(d, "special", title=s.title, lead=s.lead)
             continue
+        today: list[Optional[str]] = []
+        tries = 0
+        while len(today) < n and tries < len(order):
+            p = order[ptr % len(order)]
+            tries += 1
+            if not cfg.is_active(p, d):
+                ptr += 1            # skip people who haven't joined / have left
+                continue
+            if p in today:
+                break               # fewer active people than slots
+            today.append(p)
+            ptr += 1
+        while len(today) < n:
+            today.append(None)
+        slots[d] = today
+
+    regular = [d for d in dates if d in slots]
+    swaps: dict[date, list[Swap]] = {d: [] for d in regular}
+    notes: dict[date, Optional[str]] = {d: None for d in regular}
+
+    def future_slot(person: str, start: int, avoid_date: Optional[date] = None):
+        """First (index, position) after `start` where `person` holds a slot."""
+        for j in range(start + 1, len(regular)):
+            if regular[j] == avoid_date:
+                continue
+            for k, q in enumerate(slots[regular[j]]):
+                if q == person:
+                    return j, k
+        return None
+
+    # --- 2./3. resolve overrides and absences in date order ----------------- #
+    for i, d in enumerate(regular):
+        cur = slots[d]
+
         if d in cfg.overrides:
-            chosen = list(cfg.overrides[d])
-            for p in chosen:            # they've now presented: send to the back
-                queue.remove(p)
-                queue.append(p)
-            out.append(Meeting(d, "regular", presenters=chosen, note="manual override"))
+            wanted = list(cfg.overrides[d])
+            missing = [w for w in wanted if w not in cur]
+            for idx, p in enumerate(cur):
+                if p in wanted:
+                    continue
+                if not missing:
+                    cur[idx] = None             # override lists fewer people than slots
+                    continue
+                w = missing.pop(0)
+                # Hand the displaced person the override-person's next turn.
+                if p is not None:
+                    hit = future_slot(w, i)
+                    while hit is not None and p in slots[regular[hit[0]]]:
+                        hit = future_slot(w, hit[0])
+                    if hit is not None:
+                        slots[regular[hit[0]]][hit[1]] = p
+                cur[idx] = w
+            for w in missing:                   # override lists more people than slots
+                cur.append(w)
+            notes[d] = "manual override"
             continue
 
-        chosen: list[str] = []
-        skipped: list[str] = []
-        for p in queue:
-            if len(chosen) == n:
-                break
-            if not cfg.is_active(p, d):
+        def same_week(a: date, b: date) -> bool:
+            return a.isocalendar()[:2] == b.isocalendar()[:2]
+
+        def has_slot_in_week(person: str, when: date, except_date: date) -> bool:
+            return any(person in slots[x] for x in regular if x != except_date and same_week(x, when))
+
+        for idx, p in enumerate(cur):
+            if p is None or cfg.is_available(p, d):
                 continue
-            if cfg.is_available(p, d):
-                chosen.append(p)
-            else:
-                skipped.append(p)
-        for p in chosen:
-            queue.remove(p)
-            queue.append(p)
-        note = None
-        if len(chosen) < n:
-            note = f"only {len(chosen)} presenter(s) available" if chosen else "nobody available"
-        out.append(Meeting(d, "regular", presenters=chosen, skipped=skipped, note=note))
+            # Candidate swaps, earliest first. Prefer one that gives nobody two talks in
+            # the same week; fall back to the earliest workable one.
+            best, fallback = None, None
+            for j in range(i + 1, len(regular)):
+                d2 = regular[j]
+                if p in slots[d2]:
+                    continue                    # p already presents on d2
+                for k, q in enumerate(slots[d2]):
+                    if q is None or q in cur:
+                        continue
+                    if not (cfg.is_available(q, d) and cfg.is_active(q, d)):
+                        continue
+                    if not (cfg.is_available(p, d2) and cfg.is_active(p, d2)):
+                        continue
+                    if fallback is None:
+                        fallback = (j, k, q)
+                    if not has_slot_in_week(q, d, d2) and not has_slot_in_week(p, d2, d):
+                        best = (j, k, q)
+                        break
+                if best:
+                    break
+            partner = best or fallback
+            if partner:
+                j, k, q = partner
+                cur[idx] = q
+                slots[regular[j]][k] = p
+                swaps[d].append(Swap(p, q, regular[j]))
+                continue
+            # No future slot to trade (e.g. end of semester): the next available person
+            # in rotation order simply steps in.
+            start = order.index(p) if p in order else 0
+            stand_in = None
+            for step in range(1, len(order)):
+                q = order[(start + step) % len(order)]
+                if q not in cur and cfg.is_available(q, d) and cfg.is_active(q, d):
+                    stand_in = q
+                    break
+            cur[idx] = stand_in
+            swaps[d].append(Swap(p, stand_in, None))
+
+    # --- assemble ------------------------------------------------------------ #
+    rank = {p: i for i, p in enumerate(order)}
+    out: list[Meeting] = []
+    for d in dates:
+        if d in fixed:
+            out.append(fixed[d])
+            continue
+        people = sorted((p for p in slots[d] if p), key=lambda p: rank.get(p, 999))
+        note = notes[d]
+        if len(people) < n and note is None:
+            note = f"only {len(people)} presenter(s) available" if people else "nobody available"
+        out.append(Meeting(d, "regular", presenters=people, swaps=swaps[d], note=note))
     return out
 
 
@@ -401,9 +545,17 @@ def describe_line(m: Meeting, cfg: Config, mention: bool) -> str:
     return join_names(m.presenters, fmt)
 
 
+def swap_note(sw: Swap, tomorrow: bool = False) -> str:
+    when = "tomorrow" if tomorrow else "that day"
+    if sw.stand_in is None:
+        return f"{sw.out} is out {when} and nobody could swap in"
+    if sw.new_date is not None:
+        return f"{sw.out} is out {when} → {sw.stand_in} steps in; {sw.out} presents {fmt_date(sw.new_date)} instead"
+    return f"{sw.out} is out {when} → {sw.stand_in} steps in"
+
+
 def render_reminder(m: Meeting, nxt: Optional[Meeting], cfg: Config) -> str:
     when = f"{fmt_date(m.date)}, {cfg.meeting_time}".rstrip(", ")
-    links = repo_links()
     lines: list[str] = []
 
     if m.kind == "no_meeting":
@@ -425,17 +577,8 @@ def render_reminder(m: Meeting, nxt: Optional[Meeting], cfg: Config) -> str:
             lines.append(f"Presenting: {join_names(m.presenters, cfg.mention)}")
         else:
             lines.append("Presenting: _nobody is available — please sort it out in the thread_")
-        if m.skipped:
-            if len(m.skipped) == 1:
-                lines.append(
-                    f"_{m.skipped[0]} is out tomorrow, so the next person in line takes the slot; "
-                    f"{m.skipped[0]} presents at the next meeting._"
-                )
-            else:
-                lines.append(
-                    f"_{join_names(m.skipped)} are out tomorrow, so the next people in line take the slots; "
-                    f"they present at the next meeting they're available._"
-                )
+        for sw in m.swaps:
+            lines.append(f"_{swap_note(sw, tomorrow=True)}._")
         if m.note == "manual override":
             lines.append("_(order set manually for this date)_")
         if nxt:
@@ -443,30 +586,62 @@ def render_reminder(m: Meeting, nxt: Optional[Meeting], cfg: Config) -> str:
         if nxt is None:
             lines.append("_This is the last group meeting of the semester._")
 
-    if m.kind == "no_meeting":
-        if links:
-            lines.append(f"_<{links['schedule']}|Full schedule>_")
-    else:
-        footer = f"Can't present? Tell {cfg.organizer}"
-        if links:
-            footer = (
-                f"Can't present? <{links['edit']}|Edit schedule.json> (or tell {cfg.organizer}) — "
-                f"the rotation adjusts automatically · <{links['schedule']}|Full schedule>"
-            )
-        lines.append(f"_{footer}_")
+    lines.append(f"_{footer_text(cfg, for_no_meeting=(m.kind == 'no_meeting'))}_")
     return "\n".join(lines)
 
 
-def render_schedule_post(schedule: list[Meeting], cfg: Config, from_date: date) -> str:
+def footer_text(cfg: Config, for_no_meeting: bool = False) -> str:
+    """Where to go to change things: the Google Sheet if configured, else the JSON."""
     links = repo_links()
+    sheet = sheet_edit_url()
+    full = f" · <{links['schedule']}|Full schedule>" if links else ""
+    if for_no_meeting:
+        if sheet:
+            return f"<{sheet}|Availability sheet>{full}".lstrip(" ·")
+        return f"<{links['schedule']}|Full schedule>" if links else ""
+    if sheet:
+        return (f"Can't present? Type *out* under your name in the <{sheet}|availability sheet> "
+                f"(or tell {cfg.organizer}) — the rotation adjusts automatically{full}")
+    if links:
+        return (f"Can't present? <{links['edit']}|Edit schedule.json> (or tell {cfg.organizer}) — "
+                f"the rotation adjusts automatically{full}")
+    return f"Can't present? Tell {cfg.organizer}"
+
+
+def render_csv(schedule: list[Meeting], cfg: Config) -> str:
+    """Compact CSV of the schedule, imported live by the Google Sheet's 'Schedule' tab."""
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\n")
+    w.writerow(["Date", "Day", "Presenters", "Notes"])
+    for m in schedule:
+        notes = []
+        if m.kind == "no_meeting":
+            who = "no meeting"
+            notes.append(m.title or "")
+        elif m.kind == "special":
+            who = f"Special session: {m.title}"
+            if m.lead:
+                notes.append(f"led by {m.lead}")
+        else:
+            who = join_names(m.presenters)
+            for sw in m.swaps:
+                notes.append(swap_note(sw))
+            if m.note:
+                notes.append(m.note)
+        w.writerow([m.date.isoformat(), WEEKDAY_NAMES[m.date.weekday()], who, "; ".join(n for n in notes if n)])
+    return buf.getvalue()
+
+
+def render_schedule_post(schedule: list[Meeting], cfg: Config, from_date: date) -> str:
     days = " & ".join(WEEKDAY_NAMES[d] for d in sorted(cfg.meeting_days))
     lines = [f":calendar: *Group meeting schedule* ({days}, {cfg.meeting_time})"]
     for m in schedule:
         if m.date < from_date:
             continue
         lines.append(f"• {fmt_date(m.date)} — {describe_line(m, cfg, mention=False)}")
-    if links:
-        lines.append(f"_Full schedule & how to mark yourself out: <{links['schedule']}|SCHEDULE.md>_")
+    foot = footer_text(cfg)
+    if foot:
+        lines.append(f"_{foot}_")
     return "\n".join(lines)
 
 
@@ -479,7 +654,9 @@ def render_markdown(schedule: list[Meeting], cfg: Config, today: Optional[date] 
         f"{cfg.presenters_per_meeting} presenters per meeting · "
         f"{fmt_date(cfg.start_date)} – {fmt_date(cfg.end_date)}, {cfg.end_date.year}",
         "",
-        "> This file is generated automatically from `schedule.json` — edit that file, not this one.",
+        "> This file is generated automatically — don't edit it. To mark yourself out or add a "
+        "special session, use the shared **Availability** Google Sheet (link pinned in Slack); "
+        "the bot re-reads it every 30 minutes.",
         "> A reminder is posted to Slack at 10:00 AM the day before each meeting.",
         "",
         f"Rotation order: {' → '.join(cfg.rotation)}",
@@ -499,8 +676,8 @@ def render_markdown(schedule: list[Meeting], cfg: Config, today: Optional[date] 
             notes.append("rotation paused")
         else:
             who = join_names(m.presenters)
-            if m.skipped:
-                notes.append(f"{join_names(m.skipped)} out → presents next")
+            for sw in m.swaps:
+                notes.append(swap_note(sw))
             if m.note:
                 notes.append(m.note)
         marker = " ← next" if today and m.date >= today and not any(
@@ -516,12 +693,13 @@ def render_markdown(schedule: list[Meeting], cfg: Config, today: Optional[date] 
         "## How the rotation works",
         "",
         f"People present in the order above, {cfg.presenters_per_meeting} per meeting. "
-        "If someone who is up is unavailable, the next person in line takes the slot and the "
-        "skipped person presents at the next meeting they can attend. Special sessions and "
-        "no-meeting days pause the rotation — nobody loses their turn.",
+        "If someone who is up is unavailable, they swap dates with the next scheduled person who "
+        "can make it — nobody else moves. Special sessions and no-meeting days pause the rotation; "
+        "nobody loses their turn.",
         "",
-        "To mark yourself out, add a special session, or cancel a meeting, edit `schedule.json` "
-        "(the `_help` block at the top explains each field). Commit, and this file updates itself.",
+        "To mark yourself out, type *out* in your column of the Availability sheet for that date. "
+        "To add a special session or cancel a meeting, fill the *Special session* or *No meeting* "
+        "column of that row. Within 30 minutes the bot updates this page and posts what changed in Slack.",
         "",
     ]
     return "\n".join(out)
@@ -570,6 +748,272 @@ def now_local(cfg: Config, today_override: Optional[str]) -> datetime:
 
 
 # --------------------------------------------------------------------------- #
+# Google Sheet sync
+# --------------------------------------------------------------------------- #
+class SheetError(Exception):
+    pass
+
+
+# Anything else typed in a person's cell means "not available". Blank = available.
+AVAILABLE_WORDS = {"", "ok", "okay", "yes", "y", "available", "in", "here", "present", "✓", "✔", "fine"}
+
+# Header names we recognise (compared case-insensitively, after trimming).
+HEADER_DATE = {"date"}
+HEADER_SPECIAL = {"special session", "special session (title)", "special", "special session title"}
+HEADER_LEAD = {"led by", "lead", "leader", "special session lead"}
+HEADER_NO_MEETING = {"no meeting", "no meeting (reason)", "no meeting reason", "cancelled", "canceled"}
+HEADER_OVERRIDE = {"override presenters", "override", "force presenters", "override (names)"}
+MIN_ROWS_FOR_SYNC = 3   # refuse to sync from a sheet that looks accidentally emptied
+
+
+def sheet_id() -> str:
+    return os.environ.get("GOOGLE_SHEET_ID", "").strip()
+
+
+def sheet_edit_url() -> Optional[str]:
+    explicit = os.environ.get("SHEET_URL", "").strip()
+    if explicit:
+        return explicit
+    sid = sheet_id()
+    return f"https://docs.google.com/spreadsheets/d/{sid}/edit" if sid else None
+
+
+def sheet_csv_urls() -> list[str]:
+    urls = []
+    explicit = os.environ.get("SHEET_CSV_URL", "").strip()
+    if explicit:
+        urls.append(explicit)
+    sid = sheet_id()
+    if sid:
+        tab = os.environ.get("GOOGLE_SHEET_TAB", "").strip() or "Availability"
+        urls.append(f"https://docs.google.com/spreadsheets/d/{sid}/gviz/tq?tqx=out:csv&headers=1"
+                    f"&sheet={urllib.parse.quote(tab)}")
+        urls.append(f"https://docs.google.com/spreadsheets/d/{sid}/export?format=csv&gid=0")
+    return urls
+
+
+def fetch_sheet_csv() -> str:
+    urls = sheet_csv_urls()
+    if not urls:
+        raise SheetError("GOOGLE_SHEET_ID (or SHEET_CSV_URL) is not set — add it as a repository secret.")
+    errors = []
+    for url in urls:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "group-meeting-bot/1.0"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = resp.read().decode("utf-8-sig", "replace")
+        except urllib.error.HTTPError as e:
+            errors.append(f"HTTP {e.code} from {url.split('?')[0]}")
+            continue
+        except urllib.error.URLError as e:
+            errors.append(f"{e.reason} from {url.split('?')[0]}")
+            continue
+        if body.lstrip().startswith("<"):
+            errors.append("got a web page instead of CSV — is the sheet shared as "
+                          "'Anyone with the link' (Viewer or Editor)?")
+            continue
+        return body
+    raise SheetError("Could not read the Google Sheet: " + "; ".join(errors))
+
+
+def parse_sheet_date(s: str, cfg: Config) -> Optional[date]:
+    s = (s or "").strip()
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%Y/%m/%d", "%b %d, %Y", "%B %d, %Y",
+                "%d %b %Y", "%d %B %Y", "%a %b %d %Y", "%a, %b %d, %Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            pass
+    # No year given ("Tue Sep 8", "Sep 8"): pick the year that lands in the semester.
+    for fmt in ("%a %b %d", "%b %d", "%A %B %d", "%B %d", "%a, %b %d"):
+        try:
+            t = datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+        for y in sorted({cfg.start_date.year, cfg.end_date.year}):
+            try:
+                d = date(y, t.month, t.day)
+            except ValueError:
+                continue
+            if cfg.start_date <= d <= cfg.end_date:
+                return d
+    return None
+
+
+@dataclass
+class SheetData:
+    unavailable: dict[str, list[str]]
+    special_sessions: dict[str, dict]
+    no_meeting: dict[str, str]
+    overrides: dict[str, list[str]]
+    warnings: list[str]
+    rows: int
+
+
+def parse_sheet(text: str, cfg: Config) -> SheetData:
+    rows = [r for r in csv.reader(io.StringIO(text)) if any(c.strip() for c in r)]
+    if not rows:
+        raise SheetError("the sheet is empty")
+    header = [h.strip().casefold() for h in rows[0]]
+
+    def find(names: set[str]) -> Optional[int]:
+        for i, h in enumerate(header):
+            if h in names:
+                return i
+        return None
+
+    date_col = find(HEADER_DATE)
+    if date_col is None:
+        raise SheetError(f"no 'Date' column in the first row (found: {', '.join(rows[0])})")
+    by_fold = {p.casefold(): p for p in cfg.rotation}
+    people_cols = {by_fold[h]: i for i, h in enumerate(header) if h in by_fold}
+    special_col, lead_col = find(HEADER_SPECIAL), find(HEADER_LEAD)
+    no_meeting_col, override_col = find(HEADER_NO_MEETING), find(HEADER_OVERRIDE)
+
+    warnings: list[str] = []
+    missing = [p for p in cfg.rotation if p not in people_cols]
+    if missing:
+        warnings.append(f"the sheet has no column for {join_names(missing)} — they can't mark themselves out there")
+
+    unavailable: dict[str, list[str]] = {}
+    special: dict[str, dict] = {}
+    no_meeting: dict[str, str] = {}
+    overrides: dict[str, list[str]] = {}
+    seen: set[date] = set()
+    n_rows = 0
+
+    for r in rows[1:]:
+        def cell(i: Optional[int]) -> str:
+            return r[i].strip() if i is not None and i < len(r) else ""
+
+        raw_date = cell(date_col)
+        d = parse_sheet_date(raw_date, cfg)
+        if d is None:
+            if raw_date:
+                warnings.append(f"row with date '{raw_date}' not understood — ignored")
+            continue
+        n_rows += 1
+        if d in seen:
+            warnings.append(f"{fmt_date(d)} appears twice in the sheet — using both rows")
+        seen.add(d)
+        if not (cfg.start_date <= d <= cfg.end_date) or not cfg.is_meeting_day(d):
+            warnings.append(f"{fmt_date(d)} ({d}) is not a meeting day this semester — ignored")
+            continue
+        iso = d.isoformat()
+
+        for person, i in people_cols.items():
+            if cell(i).casefold() not in AVAILABLE_WORDS:
+                unavailable.setdefault(person, []).append(iso)
+
+        nm, sp = cell(no_meeting_col), cell(special_col)
+        if nm:
+            no_meeting[iso] = nm
+        if sp:
+            if nm:
+                warnings.append(f"{fmt_date(d)}: both 'No meeting' and 'Special session' are filled — treating it as no meeting")
+            else:
+                entry = {"title": sp}
+                if cell(lead_col):
+                    entry["lead"] = cell(lead_col)
+                special[iso] = entry
+
+        ov = cell(override_col)
+        if ov:
+            names = [x.strip() for x in re.split(r"[,&/;+]+|\band\b", ov) if x.strip()]
+            resolved = []
+            for nme in names:
+                if nme.casefold() in by_fold and by_fold[nme.casefold()] not in resolved:
+                    resolved.append(by_fold[nme.casefold()])
+                else:
+                    warnings.append(f"{fmt_date(d)}: override name '{nme}' isn't in the rotation — ignored")
+            if resolved and not nm and not sp:
+                overrides[iso] = resolved
+
+    if n_rows < MIN_ROWS_FOR_SYNC:
+        raise SheetError(f"only {n_rows} date row(s) found — refusing to sync in case the sheet was emptied by accident")
+
+    return SheetData(
+        unavailable={p: sorted(set(v)) for p, v in sorted(unavailable.items())},
+        special_sessions=dict(sorted(special.items())),
+        no_meeting=dict(sorted(no_meeting.items())),
+        overrides=dict(sorted(overrides.items())),
+        warnings=warnings,
+        rows=n_rows,
+    )
+
+
+def sheet_template_rows(cfg: Config) -> list[list[str]]:
+    """The Availability tab, pre-filled from the current schedule.json."""
+    header = ["Date", "Day", "Presenters (auto)", "Notes (auto)", *cfg.rotation,
+              "Special session (title)", "Led by", "No meeting (reason)", "Override presenters"]
+    rows = [header]
+    for d in meeting_dates(cfg):
+        iso = d.isoformat()
+        row = [iso, WEEKDAY_NAMES[d.weekday()], "", ""]
+        for p in cfg.rotation:
+            row.append("out" if d in cfg.unavailable.get(p, set()) else "")
+        sp = cfg.special_sessions.get(d)
+        row += [sp.title if sp else "", (sp.lead or "") if sp else "",
+                cfg.no_meeting.get(d, ""), ", ".join(cfg.overrides.get(d, []))]
+        rows.append(row)
+    return rows
+
+
+def apply_sheet_to_config(data: SheetData, path: Optional[Path] = None) -> bool:
+    """Write the sheet-owned sections into schedule.json. Returns True if the file changed."""
+    path = path or CONFIG_PATH
+    text = path.read_text(encoding="utf-8")
+    raw = json.loads(text)
+    raw["unavailable"] = data.unavailable
+    raw["special_sessions"] = data.special_sessions
+    raw["no_meeting"] = data.no_meeting
+    raw["overrides"] = data.overrides
+    new_text = json.dumps(raw, indent=2, ensure_ascii=False) + "\n"
+    if new_text == text:
+        return False
+    path.write_text(new_text, encoding="utf-8")
+    return True
+
+
+def diff_schedules(old: list[Meeting], new: list[Meeting], from_date: date):
+    """Meetings on/after from_date whose outcome changed: list of (date, old, new)."""
+    by_old = {m.date: m for m in old}
+    by_new = {m.date: m for m in new}
+    changes = []
+    for d in sorted(set(by_old) | set(by_new)):
+        if d < from_date:
+            continue
+        a, b = by_old.get(d), by_new.get(d)
+        key = lambda m: (m.kind, tuple(m.presenters), m.title, m.lead) if m else None  # noqa: E731
+        if key(a) != key(b):
+            changes.append((d, a, b))
+    return changes
+
+
+def render_change_alert(changes, cfg: Config, warnings: list[str], limit: int = 12) -> str:
+    lines = [":pencil2: *Group meeting schedule updated*"]
+    for d, a, b in changes[:limit]:
+        was = describe_line(a, cfg, mention=False) if a else "—"
+        now = describe_line(b, cfg, mention=False) if b else "—"
+        why = ""
+        if b and b.kind == "regular" and b.skipped:
+            why = f" ({join_names(b.skipped)} out)"
+        elif b and b.kind == "regular" and b.note == "manual override":
+            why = " (set manually)"
+        lines.append(f"• {fmt_date(d)}: {was} → *{now}*{why}")
+    if len(changes) > limit:
+        lines.append(f"…and {len(changes) - limit} more")
+    for w in warnings[:5]:
+        lines.append(f":warning: {w}")
+    foot = footer_text(cfg)
+    if foot:
+        lines.append(f"_{foot}_")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
 # Commands
 # --------------------------------------------------------------------------- #
 def cmd_validate(args) -> int:
@@ -587,19 +1031,77 @@ def cmd_schedule(args) -> int:
     cfg = load_config()
     for m in build_schedule(cfg):
         extra = ""
-        if m.skipped:
-            extra = f"   ({join_names(m.skipped)} out → presents next)"
+        if m.swaps:
+            extra = "   (" + "; ".join(swap_note(sw) for sw in m.swaps) + ")"
         elif m.note:
             extra = f"   ({m.note})"
         print(f"{m.date}  {fmt_date(m.date):<11} {describe_line(m, cfg, mention=False)}{extra}")
     return 0
 
 
-def cmd_render_md(args) -> int:
+def cmd_render(args) -> int:
     cfg = load_config()
     today = now_local(cfg, args.today).date()
-    SCHEDULE_MD_PATH.write_text(render_markdown(build_schedule(cfg), cfg, today), encoding="utf-8")
-    print(f"wrote {SCHEDULE_MD_PATH.name}")
+    schedule = build_schedule(cfg)
+    SCHEDULE_MD_PATH.write_text(render_markdown(schedule, cfg, today), encoding="utf-8")
+    SCHEDULE_CSV_PATH.write_text(render_csv(schedule, cfg), encoding="utf-8")
+    print(f"wrote {SCHEDULE_MD_PATH.name} and {SCHEDULE_CSV_PATH.name}")
+    return 0
+
+
+def cmd_sheet_template(args) -> int:
+    cfg = load_config()
+    w = csv.writer(sys.stdout, lineterminator="\n")
+    for row in sheet_template_rows(cfg):
+        w.writerow(row)
+    return 0
+
+
+def cmd_sync_sheet(args) -> int:
+    cfg_before = load_config()
+    today = now_local(cfg_before, args.today).date()
+    schedule_before = build_schedule(cfg_before)
+
+    try:
+        text = Path(args.csv_file).read_text(encoding="utf-8-sig") if args.csv_file else fetch_sheet_csv()
+        data = parse_sheet(text, cfg_before)
+    except SheetError as e:
+        print(f"sheet sync skipped: {e}", file=sys.stderr)
+        return 3
+
+    for w in data.warnings:
+        print(f"warning: {w}")
+
+    # Build the would-be config first so a bad sheet can never leave a broken schedule.json behind.
+    merged = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    merged.update({"unavailable": data.unavailable, "special_sessions": data.special_sessions,
+                   "no_meeting": data.no_meeting, "overrides": data.overrides})
+    try:
+        cfg_after = config_from_dict(merged)
+    except ConfigError as e:
+        print(f"sheet sync skipped: the sheet would make schedule.json invalid ({e})", file=sys.stderr)
+        return 3
+    changes = diff_schedules(schedule_before, build_schedule(cfg_after), today)
+
+    if args.dry_run:
+        print(f"sheet read OK ({data.rows} date rows). {len(changes)} upcoming meeting(s) would change.")
+        if changes:
+            print("--- would post to Slack ---")
+            print(render_change_alert(changes, cfg_after, data.warnings))
+        return 0
+
+    if not apply_sheet_to_config(data):
+        print(f"sheet read OK ({data.rows} date rows); schedule.json already up to date.")
+        return 0
+    print(f"schedule.json updated from the sheet ({data.rows} date rows); "
+          f"{len(changes)} upcoming meeting(s) changed.")
+    if changes:
+        text = render_change_alert(changes, cfg_after, data.warnings)
+        if args.no_post:
+            print(text)
+        else:
+            post_to_slack(text)
+            print("Posted change alert.")
     return 0
 
 
@@ -679,9 +1181,19 @@ def main(argv=None) -> int:
     sub.add_parser("validate").set_defaults(fn=cmd_validate)
     sub.add_parser("schedule").set_defaults(fn=cmd_schedule)
 
-    p = sub.add_parser("render-md")
-    p.add_argument("--today")
-    p.set_defaults(fn=cmd_render_md)
+    for name in ("render", "render-md"):          # render-md kept as an alias
+        p = sub.add_parser(name)
+        p.add_argument("--today")
+        p.set_defaults(fn=cmd_render)
+
+    sub.add_parser("sheet-template").set_defaults(fn=cmd_sheet_template)
+
+    p = sub.add_parser("sync-sheet")
+    p.add_argument("--today", help="pretend today is this date (YYYY-MM-DD)")
+    p.add_argument("--dry-run", action="store_true", help="show what would change; touch nothing")
+    p.add_argument("--no-post", action="store_true", help="update schedule.json but don't post to Slack")
+    p.add_argument("--csv-file", help="read this CSV file instead of the Google Sheet (testing)")
+    p.set_defaults(fn=cmd_sync_sheet)
 
     p = sub.add_parser("remind")
     p.add_argument("--today", help="pretend today is this date (YYYY-MM-DD)")

@@ -2,7 +2,7 @@
 
 **Tue & Wed, 11:00-12:00** · #dawvas_shared · 2 presenters per meeting · Tue Sep 8 – Wed Dec 9, 2026
 
-> This file is generated automatically from `schedule.json` — edit that file, not this one.
+> This file is generated automatically — don't edit it. To mark yourself out or add a special session, use the shared **Availability** Google Sheet (link pinned in Slack); the bot re-reads it every 30 minutes.
 > A reminder is posted to Slack at 10:00 AM the day before each meeting.
 
 Rotation order: Kailey → Nathan → Kristen → Danyang → Jose → Phillip
@@ -49,6 +49,6 @@ Rotation order: Kailey → Nathan → Kristen → Danyang → Jose → Phillip
 
 ## How the rotation works
 
-People present in the order above, 2 per meeting. If someone who is up is unavailable, the next person in line takes the slot and the skipped person presents at the next meeting they can attend. Special sessions and no-meeting days pause the rotation — nobody loses their turn.
+People present in the order above, 2 per meeting. If someone who is up is unavailable, they swap dates with the next scheduled person who can make it — nobody else moves. Special sessions and no-meeting days pause the rotation; nobody loses their turn.
 
-To mark yourself out, add a special session, or cancel a meeting, edit `schedule.json` (the `_help` block at the top explains each field). Commit, and this file updates itself.
+To mark yourself out, type *out* in your column of the Availability sheet for that date. To add a special session or cancel a meeting, fill the *Special session* or *No meeting* column of that row. Within 30 minutes the bot updates this page and posts what changed in Slack.

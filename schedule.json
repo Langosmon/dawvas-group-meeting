@@ -11,19 +11,26 @@
     "New semester: update start_date/end_date, run `python rotation.py sheet-template` and import the",
     "result into the Availability tab (see README)."
   ],
-
   "channel": "#dawvas_shared",
   "organizer": "Jose",
   "timezone": "America/Indianapolis",
-  "meeting_days": ["Tue", "Wed"],
+  "meeting_days": [
+    "Tue",
+    "Wed"
+  ],
   "meeting_time": "11:00-12:00",
   "presenters_per_meeting": 2,
   "start_date": "2026-09-08",
   "end_date": "2026-12-09",
   "announce_no_meeting": true,
-
-  "rotation": ["Kailey", "Nathan", "Kristen", "Danyang", "Jose", "Phillip"],
-
+  "rotation": [
+    "Kailey",
+    "Nathan",
+    "Kristen",
+    "Danyang",
+    "Jose",
+    "Phillip"
+  ],
   "_slack_ids_help": "Optional. Paste each person's Slack member ID (profile > three dots > Copy member ID) to @-mention them in reminders. Leave empty to show plain names.",
   "slack_ids": {
     "Kailey": "",
@@ -33,15 +40,27 @@
     "Jose": "",
     "Phillip": ""
   },
-
-  "_joined_left_example": { "joined": { "NewPerson": "2026-10-20" }, "left": { "Phillip": "2026-11-15" } },
+  "_joined_left_example": {
+    "joined": {
+      "NewPerson": "2026-10-20"
+    },
+    "left": {
+      "Phillip": "2026-11-15"
+    }
+  },
   "joined": {},
   "left": {},
-
   "_synced_from_sheet": "The four sections below are filled in automatically from the Google Sheet.",
-  "unavailable": {},
+  "unavailable": {
+    "Jose": [
+      "2026-09-29"
+    ]
+  },
   "special_sessions": {
-    "2026-09-16": { "title": "AI session: using Agents on Purdue RCAC", "lead": "Jose" }
+    "2026-09-16": {
+      "title": "AI session: using Agents on Purdue RCAC",
+      "lead": "Jose"
+    }
   },
   "no_meeting": {
     "2026-10-13": "October break",

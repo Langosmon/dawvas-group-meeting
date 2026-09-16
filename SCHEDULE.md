@@ -11,8 +11,8 @@ Rotation order: Kailey → Nathan → Kristen → Danyang → Jose → Phillip
 |---|---|---|
 | Tue Sep 8 | Kailey & Nathan |  |
 | Wed Sep 9 | Kristen & Jose | Danyang is out that day → Jose steps in; Danyang presents Tue Sep 15 instead |
-| Tue Sep 15 ← next | Danyang & Phillip |  |
-| Wed Sep 16 | Kailey & Nathan |  |
+| Tue Sep 15 | Danyang & Phillip |  |
+| Wed Sep 16 ← next | Kailey & Nathan |  |
 | Tue Sep 22 | Kristen & Danyang |  |
 | Wed Sep 23 | ✨ AI session: using Agents on Purdue RCAC | led by Jose; rotation paused |
 | Tue Sep 29 | Jose & Phillip |  |

@@ -18,8 +18,8 @@ Rotation order: Kailey → Nathan → Kristen → Danyang → Jose → Phillip
 | Tue Sep 29 | Jose & Phillip |  |
 | Wed Sep 30 | Kailey & Nathan |  |
 | Tue Oct 6 | Kristen & Danyang |  |
-| Wed Oct 7 ← next | Jose & Phillip |  |
-| Tue Oct 13 | _no meeting_ | October break |
+| Wed Oct 7 | Jose & Phillip |  |
+| Tue Oct 13 ← next | _no meeting_ | October break |
 | Wed Oct 14 | Kailey & Nathan |  |
 | Tue Oct 20 | Kristen & Danyang |  |
 | Wed Oct 21 | Jose & Phillip |  |

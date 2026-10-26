@@ -23,19 +23,19 @@ Rotation order: Kailey → Nathan → Kristen → Danyang → Jose → Phillip
 | Wed Oct 14 | Kailey & Nathan |  |
 | Tue Oct 20 | Danyang & Jose | Kristen is out that day → Jose steps in; Kristen presents Wed Oct 21 instead |
 | Wed Oct 21 | Kristen & Phillip |  |
-| Tue Oct 27 ← next | Nathan & Kristen | Kailey is out that day → Kristen steps in; Kailey presents Wed Oct 28 instead |
-| Wed Oct 28 | Kailey & Danyang |  |
+| Tue Oct 27 ← next | Nathan & Jose | Kailey is out that day → Jose steps in; Kailey presents Tue Nov 24 instead |
+| Wed Oct 28 | Kristen & Danyang |  |
 | Tue Nov 3 | Jose & Phillip |  |
-| Wed Nov 4 | Kailey & Nathan |  |
+| Wed Nov 4 | Nathan & Kristen | Kailey is out that day → Kristen steps in; Kailey presents Wed Dec 2 instead |
 | Tue Nov 10 | Kristen & Danyang |  |
 | Wed Nov 11 | Jose & Phillip |  |
-| Tue Nov 17 | Kailey & Nathan |  |
+| Tue Nov 17 | Nathan & Jose | Kailey is out that day → Jose steps in; Kailey presents Tue Dec 8 instead |
 | Wed Nov 18 | Kristen & Danyang |  |
-| Tue Nov 24 | Jose & Phillip |  |
+| Tue Nov 24 | Kailey & Phillip |  |
 | Wed Nov 25 | _no meeting_ | Thanksgiving |
 | Tue Dec 1 | Kailey & Nathan |  |
-| Wed Dec 2 | Kristen & Danyang |  |
-| Tue Dec 8 | Jose & Phillip |  |
+| Wed Dec 2 | Kailey & Danyang |  |
+| Tue Dec 8 | Kailey & Phillip |  |
 | Wed Dec 9 | Kailey & Nathan |  |
 
 ## Talks per person

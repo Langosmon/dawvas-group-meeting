@@ -25,8 +25,8 @@ Rotation order: Kailey → Nathan → Kristen → Danyang → Jose → Phillip
 | Wed Oct 21 | Jose & Phillip |  |
 | Tue Oct 27 | Nathan & Jose | Kailey is out that day → Jose steps in; Kailey presents Tue Nov 24 instead |
 | Wed Oct 28 | Kristen & Danyang |  |
-| Tue Nov 3 ← next | Jose & Phillip |  |
-| Wed Nov 4 | Nathan & Kristen |  |
+| Tue Nov 3 | Jose & Phillip |  |
+| Wed Nov 4 ← next | Nathan & Kristen |  |
 | Tue Nov 10 | Kristen & Danyang |  |
 | Wed Nov 11 | Jose & Phillip |  |
 | Tue Nov 17 | Nathan & Kristen | Kailey is out that day → Kristen steps in; Kailey presents Wed Dec 2 instead |
